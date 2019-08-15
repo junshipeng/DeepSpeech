@@ -1,319 +1,464 @@
-#ifdef DS_NATIVE_MODEL
-#define EIGEN_USE_THREADS
-#define EIGEN_USE_CUSTOM_THREAD_POOL
-
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-
-#include "native_client/deepspeech_model.h" // generated
+#include <algorithm>
+#ifdef _MSC_VER
+  #define _USE_MATH_DEFINES
 #endif
-
+#include <cmath>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "deepspeech.h"
-#include "deepspeech_utils.h"
 #include "alphabet.h"
-#include "beam_search.h"
+#include "modelstate.h"
 
-#include "tensorflow/core/public/session.h"
-#include "tensorflow/core/platform/env.h"
+#include "workspace_status.h"
 
-#define BATCH_SIZE 1
+#ifndef USE_TFLITE
+#include "tfmodelstate.h"
+#else
+#include "tflitemodelstate.h"
+#endif // USE_TFLITE
 
-using namespace tensorflow;
-using tensorflow::ctc::CTCBeamSearchDecoder;
-using tensorflow::ctc::CTCDecoder;
+#include "ctcdecode/ctc_beam_search_decoder.h"
 
-namespace DeepSpeech {
+#ifdef __ANDROID__
+#include <android/log.h>
+#define  LOG_TAG    "libdeepspeech"
+#define  LOGD(...)  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define  LOGE(...)  __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define  LOGD(...)
+#define  LOGE(...)
+#endif // __ANDROID__
 
-class Private {
-  public:
-    Session* session;
-    GraphDef graph_def;
-    int ncep;
-    int ncontext;
-    Alphabet* alphabet;
-    KenLMBeamScorer* scorer;
-    int beam_width;
-    bool run_aot;
+using std::vector;
+
+/* This is the implementation of the streaming inference API.
+
+   The streaming process uses three buffers that are fed eagerly as audio data
+   is fed in. The buffers only hold the minimum amount of data needed to do a
+   step in the acoustic model. The three buffers which live in StreamingContext
+   are:
+
+   - audio_buffer, used to buffer audio samples until there's enough data to
+     compute input features for a single window.
+
+   - mfcc_buffer, used to buffer input features until there's enough data for
+     a single timestep. Remember there's overlap in the features, each timestep
+     contains n_context past feature frames, the current feature frame, and
+     n_context future feature frames, for a total of 2*n_context + 1 feature
+     frames per timestep.
+
+   - batch_buffer, used to buffer timesteps until there's enough data to compute
+     a batch of n_steps.
+
+   Data flows through all three buffers as audio samples are fed via the public
+   API. When audio_buffer is full, features are computed from it and pushed to
+   mfcc_buffer. When mfcc_buffer is full, the timestep is copied to batch_buffer.
+   When batch_buffer is full, we do a single step through the acoustic model
+   and accumulate the intermediate decoding state in the DecoderState structure.
+
+   When finishStream() is called, we return the corresponding transcription from
+   the current decoder state.
+*/
+struct StreamingState {
+  vector<float> audio_buffer_;
+  vector<float> mfcc_buffer_;
+  vector<float> batch_buffer_;
+  vector<float> previous_state_c_;
+  vector<float> previous_state_h_;
+
+  ModelState* model_;
+  std::unique_ptr<DecoderState> decoder_state_;
+
+  StreamingState();
+  ~StreamingState();
+
+  void feedAudioContent(const short* buffer, unsigned int buffer_size);
+  char* intermediateDecode();
+  void finalizeStream();
+  char* finishStream();
+  Metadata* finishStreamWithMetadata();
+
+  void processAudioWindow(const vector<float>& buf);
+  void processMfccWindow(const vector<float>& buf);
+  void pushMfccBuffer(const vector<float>& buf);
+  void addZeroMfccWindow();
+  void processBatch(const vector<float>& buf, unsigned int n_steps);
 };
 
-Model::Model(const char* aModelPath, int aNCep, int aNContext,
-             const char* aAlphabetConfigPath, int aBeamWidth)
+StreamingState::StreamingState()
 {
-  mPriv             = new Private;
-  mPriv->session    = NULL;
-  mPriv->scorer     = NULL;
-  mPriv->ncep       = aNCep;
-  mPriv->ncontext   = aNContext;
-  mPriv->alphabet   = new Alphabet(aAlphabetConfigPath);
-  mPriv->beam_width = aBeamWidth;
-  mPriv->run_aot    = false;
+}
+
+StreamingState::~StreamingState()
+{
+}
+
+template<typename T>
+void
+shift_buffer_left(vector<T>& buf, int shift_amount)
+{
+  std::rotate(buf.begin(), buf.begin() + shift_amount, buf.end());
+  buf.resize(buf.size() - shift_amount);
+}
+
+void
+StreamingState::feedAudioContent(const short* buffer,
+                                 unsigned int buffer_size)
+{
+  // Consume all the data that was passed in, processing full buffers if needed
+  while (buffer_size > 0) {
+    while (buffer_size > 0 && audio_buffer_.size() < model_->audio_win_len_) {
+      // Convert i16 sample into f32
+      float multiplier = 1.0f / (1 << 15);
+      audio_buffer_.push_back((float)(*buffer) * multiplier);
+      ++buffer;
+      --buffer_size;
+    }
+
+    // If the buffer is full, process and shift it
+    if (audio_buffer_.size() == model_->audio_win_len_) {
+      processAudioWindow(audio_buffer_);
+      // Shift data by one step
+      shift_buffer_left(audio_buffer_, model_->audio_win_step_);
+    }
+
+    // Repeat until buffer empty
+  }
+}
+
+char*
+StreamingState::intermediateDecode()
+{
+  return model_->decode(decoder_state_.get());
+}
+
+char*
+StreamingState::finishStream()
+{
+  finalizeStream();
+  return model_->decode(decoder_state_.get());
+}
+
+Metadata*
+StreamingState::finishStreamWithMetadata()
+{
+  finalizeStream();
+  return model_->decode_metadata(decoder_state_.get());
+}
+
+void
+StreamingState::processAudioWindow(const vector<float>& buf)
+{
+  // Compute MFCC features
+  vector<float> mfcc;
+  mfcc.reserve(model_->n_features_);
+  model_->compute_mfcc(buf, mfcc);
+  pushMfccBuffer(mfcc);
+}
+
+void
+StreamingState::finalizeStream()
+{
+  // Flush audio buffer
+  processAudioWindow(audio_buffer_);
+
+  // Add empty mfcc vectors at end of sample
+  for (int i = 0; i < model_->n_context_; ++i) {
+    addZeroMfccWindow();
+  }
+
+  // Process final batch
+  if (batch_buffer_.size() > 0) {
+    processBatch(batch_buffer_, batch_buffer_.size()/model_->mfcc_feats_per_timestep_);
+  }
+}
+
+void
+StreamingState::addZeroMfccWindow()
+{
+  vector<float> zero_buffer(model_->n_features_, 0.f);
+  pushMfccBuffer(zero_buffer);
+}
+
+template<typename InputIt, typename OutputIt>
+InputIt
+copy_up_to_n(InputIt from_begin, InputIt from_end, OutputIt to_begin, int max_elems)
+{
+  int next_copy_amount = std::min<int>(std::distance(from_begin, from_end), max_elems);
+  std::copy_n(from_begin, next_copy_amount, to_begin);
+  return from_begin + next_copy_amount;
+}
+
+void
+StreamingState::pushMfccBuffer(const vector<float>& buf)
+{
+  auto start = buf.begin();
+  auto end = buf.end();
+  while (start != end) {
+    // Copy from input buffer to mfcc_buffer, stopping if we have a full context window
+    start = copy_up_to_n(start, end, std::back_inserter(mfcc_buffer_),
+                         model_->mfcc_feats_per_timestep_ - mfcc_buffer_.size());
+    assert(mfcc_buffer_.size() <= model_->mfcc_feats_per_timestep_);
+
+    // If we have a full context window
+    if (mfcc_buffer_.size() == model_->mfcc_feats_per_timestep_) {
+      processMfccWindow(mfcc_buffer_);
+      // Shift data by one step of one mfcc feature vector
+      shift_buffer_left(mfcc_buffer_, model_->n_features_);
+    }
+  }
+}
+
+void
+StreamingState::processMfccWindow(const vector<float>& buf)
+{
+  auto start = buf.begin();
+  auto end = buf.end();
+  while (start != end) {
+    // Copy from input buffer to batch_buffer, stopping if we have a full batch
+    start = copy_up_to_n(start, end, std::back_inserter(batch_buffer_),
+                         model_->n_steps_ * model_->mfcc_feats_per_timestep_ - batch_buffer_.size());
+    assert(batch_buffer_.size() <= model_->n_steps_ * model_->mfcc_feats_per_timestep_);
+
+    // If we have a full batch
+    if (batch_buffer_.size() == model_->n_steps_ * model_->mfcc_feats_per_timestep_) {
+      processBatch(batch_buffer_, model_->n_steps_);
+      batch_buffer_.resize(0);
+    }
+  }
+}
+
+void
+StreamingState::processBatch(const vector<float>& buf, unsigned int n_steps)
+{
+  vector<float> logits;
+  model_->infer(buf,
+                n_steps,
+                previous_state_c_,
+                previous_state_h_,
+                logits,
+                previous_state_c_,
+                previous_state_h_);
+
+  const int cutoff_top_n = 40;
+  const double cutoff_prob = 1.0;
+  const size_t num_classes = model_->alphabet_->GetSize() + 1; // +1 for blank
+  const int n_frames = logits.size() / (ModelState::BATCH_SIZE * num_classes);
+
+  // Convert logits to double
+  vector<double> inputs(logits.begin(), logits.end());
+
+  decoder_next(inputs.data(), 
+               *model_->alphabet_,
+               decoder_state_.get(),
+               n_frames,
+               num_classes,
+               cutoff_prob,
+               cutoff_top_n,
+               model_->beam_width_,
+               model_->scorer_);
+}
+
+int
+DS_CreateModel(const char* aModelPath,
+               unsigned int aNCep,
+               unsigned int aNContext,
+               const char* aAlphabetConfigPath,
+               unsigned int aBeamWidth,
+               ModelState** retval)
+{
+  *retval = nullptr;
+
+  DS_PrintVersions();
 
   if (!aModelPath || strlen(aModelPath) < 1) {
-    std::cerr << "No model specified, will rely on built-in model." << std::endl;
-    mPriv->run_aot = true;
-    return;
+    std::cerr << "No model specified, cannot continue." << std::endl;
+    return DS_ERR_NO_MODEL;
   }
 
-  Status status = NewSession(SessionOptions(), &mPriv->session);
-  if (!status.ok()) {
-    std::cerr << status.ToString() << std::endl;
-    return;
-  }
-
-  status = ReadBinaryProto(Env::Default(), aModelPath, &mPriv->graph_def);
-  if (!status.ok()) {
-    mPriv->session->Close();
-    mPriv->session = NULL;
-    std::cerr << status.ToString() << std::endl;
-    return;
-  }
-
-  status = mPriv->session->Create(mPriv->graph_def);
-  if (!status.ok()) {
-    mPriv->session->Close();
-    mPriv->session = NULL;
-    std::cerr << status.ToString() << std::endl;
-    return;
-  }
-
-  for (int i = 0; i < mPriv->graph_def.node_size(); ++i) {
-    NodeDef node = mPriv->graph_def.node(i);
-    if (node.name() == "logits/shape/2") {
-      int final_dim_size = node.attr().at("value").tensor().int_val(0) - 1;
-      if (final_dim_size != mPriv->alphabet->GetSize()) {
-        std::cerr << "Error: Alphabet size does not match loaded model: alphabet "
-                  << "has size " << mPriv->alphabet->GetSize()
-                  << ", but model has " << final_dim_size
-                  << " classes in its output. Make sure you're passing an alphabet "
-                  << "file with the same size as the one used for training."
-                  << std::endl;
-        mPriv->session->Close();
-        mPriv->session = NULL;
-        return;
-      }
-      break;
-    }
-  }
-}
-
-Model::~Model()
-{
-  if (mPriv->session) {
-    mPriv->session->Close();
-  }
-
-  delete mPriv->alphabet;
-  delete mPriv->scorer;
-
-  delete mPriv;
-}
-
-void
-Model::enableDecoderWithLM(const char* aAlphabetConfigPath, const char* aLMPath,
-                           const char* aTriePath, float aLMWeight,
-                           float aWordCountWeight, float aValidWordCountWeight)
-{
-  mPriv->scorer = new KenLMBeamScorer(aLMPath, aTriePath, aAlphabetConfigPath,
-                                      aLMWeight, aWordCountWeight, aValidWordCountWeight);
-}
-
-void
-Model::getInputVector(const short* aBuffer, unsigned int aBufferSize,
-                           int aSampleRate, float** aMfcc, int* aNFrames,
-                           int* aFrameLen)
-{
-  return audioToInputVector(aBuffer, aBufferSize, aSampleRate, mPriv->ncep,
-                            mPriv->ncontext, aMfcc, aNFrames, aFrameLen);
-}
-
-char*
-Model::decode(int aNFrames, float*** aLogits)
-{
-  const int batch_size = BATCH_SIZE;
-  const int top_paths = 1;
-  const int timesteps = aNFrames;
-  const size_t num_classes = mPriv->alphabet->GetSize() + 1; // +1 for blank
-
-  // Raw data containers (arrays of floats, ints, etc.).
-  int sequence_lengths[batch_size] = {timesteps};
-
-  // Convert data containers to the format accepted by the decoder, simply
-  // mapping the memory from the container to an Eigen::ArrayXi,::MatrixXf,
-  // using Eigen::Map.
-  Eigen::Map<const Eigen::ArrayXi> seq_len(&sequence_lengths[0], batch_size);
-  std::vector<Eigen::Map<const Eigen::MatrixXf>> inputs;
-  inputs.reserve(timesteps);
-  for (int t = 0; t < timesteps; ++t) {
-    inputs.emplace_back(&aLogits[t][0][0], batch_size, num_classes);
-  }
-
-  // Prepare containers for output and scores.
-  // CTCDecoder::Output is std::vector<std::vector<int>>
-  std::vector<CTCDecoder::Output> decoder_outputs(top_paths);
-  for (CTCDecoder::Output& output : decoder_outputs) {
-    output.resize(batch_size);
-  }
-  float score[batch_size][top_paths] = {{0.0}};
-  Eigen::Map<Eigen::MatrixXf> scores(&score[0][0], batch_size, top_paths);
-
-  if (mPriv->scorer == NULL) {
-    CTCBeamSearchDecoder<>::DefaultBeamScorer scorer;
-    CTCBeamSearchDecoder<> decoder(num_classes,
-                                   mPriv->beam_width,
-                                   &scorer,
-                                   batch_size);
-    decoder.Decode(seq_len, inputs, &decoder_outputs, &scores).ok();
-  } else {
-    CTCBeamSearchDecoder<KenLMBeamState> decoder(num_classes,
-                                                 mPriv->beam_width,
-                                                 mPriv->scorer,
-                                                 batch_size);
-    decoder.Decode(seq_len, inputs, &decoder_outputs, &scores).ok();
-  }
-
-  // Output is an array of shape (1, n_results, result_length).
-  // In this case, n_results is also equal to 1.
-  size_t output_length = decoder_outputs[0][0].size() + 1;
-
-  size_t decoded_length = 1; // add 1 for the \0
-  for (int i = 0; i < output_length - 1; i++) {
-    int64 character = decoder_outputs[0][0][i];
-    const std::string& str = mPriv->alphabet->StringFromLabel(character);
-    decoded_length += str.size();
-  }
-
-  char* output = (char*)malloc(sizeof(char) * decoded_length);
-  char* pen = output;
-  for (int i = 0; i < output_length - 1; i++) {
-    int64 character = decoder_outputs[0][0][i];
-    const std::string& str = mPriv->alphabet->StringFromLabel(character);
-    strncpy(pen, str.c_str(), str.size());
-    pen += str.size();
-  }
-  *pen = '\0';
-
-  for (int i = 0; i < timesteps; ++i) {
-    for (int j = 0; j < batch_size; ++j) {
-      free(aLogits[i][j]);
-    }
-    free(aLogits[i]);
-  }
-  free(aLogits);
-
-  return output;
-}
-
-char*
-Model::infer(float* aMfcc, int aNFrames, int aFrameLen)
-{
-  const int batch_size = BATCH_SIZE;
-  const int timesteps = aNFrames;
-  const size_t num_classes = mPriv->alphabet->GetSize() + 1; // +1 for blank
-
-  const int frameSize = mPriv->ncep + (2 * mPriv->ncep * mPriv->ncontext);
-
-  float*** input_data_mat = (float***)calloc(timesteps, sizeof(float**));
-  for (int i = 0; i < timesteps; ++i) {
-    input_data_mat[i] = (float**)calloc(batch_size, sizeof(float*));
-    for (int j = 0; j < batch_size; ++j) {
-      input_data_mat[i][j] = (float*)calloc(num_classes, sizeof(float));
-    }
-  }
-
-  if (mPriv->run_aot) {
-#ifdef DS_NATIVE_MODEL
-    Eigen::ThreadPool tp(2);  // Size the thread pool as appropriate.
-    Eigen::ThreadPoolDevice device(&tp, tp.NumThreads());
-
-    nativeModel nm(nativeModel::AllocMode::RESULTS_AND_TEMPS_ONLY);
-    nm.set_thread_pool(&device);
-
-    for (int ot = 0; ot < timesteps; ot += DS_MODEL_TIMESTEPS) {
-      nm.set_arg0_data(&(aMfcc[ot * frameSize]));
-      nm.Run();
-
-      // The CTCDecoder works with log-probs.
-      for (int t = 0; t < DS_MODEL_TIMESTEPS, (ot + t) < timesteps; ++t) {
-        for (int b = 0; b < batch_size; ++b) {
-          for (int c = 0; c < num_classes; ++c) {
-            input_data_mat[ot + t][b][c] = nm.result0(t, b, c);
-          }
-        }
-      }
-    }
+  std::unique_ptr<ModelState> model(
+#ifndef USE_TFLITE
+    new TFModelState()
 #else
-    std::cerr << "No support for native model built-in." << std::endl;
-    return NULL;
-#endif // DS_NATIVE_MODEL
-  } else {
-    if (aFrameLen == 0) {
-      aFrameLen = frameSize;
-    } else if (aFrameLen < frameSize) {
-      std::cerr << "mfcc features array is too small (expected " <<
-        frameSize << ", got " << aFrameLen << ")\n";
-      return NULL;
-    }
+    new TFLiteModelState()
+#endif
+  );
 
-    Tensor input(DT_FLOAT, TensorShape({1, aNFrames, frameSize}));
-
-    auto input_mapped = input.tensor<float, 3>();
-    for (int i = 0, idx = 0; i < aNFrames; i++) {
-      for (int j = 0; j < frameSize; j++, idx++) {
-        input_mapped(0, i, j) = aMfcc[idx];
-      }
-      idx += (aFrameLen - frameSize);
-    }
-
-    Tensor n_frames(DT_INT32, TensorShape({1}));
-    n_frames.scalar<int>()() = aNFrames;
-
-    // The CTC Beam Search decoder takes logits as input, we can feed those from
-    // the "logits" node in official models or
-    // the "logits_output_node" in old AOT hacking models
-    std::vector<Tensor> outputs;
-    Status status = mPriv->session->Run(
-      {{ "input_node", input }, { "input_lengths", n_frames }},
-      {"logits"}, {}, &outputs);
-
-    // If "logits" doesn't exist, this is an older graph. Try to recover.
-    if (status.code() == tensorflow::error::NOT_FOUND) {
-      status.IgnoreError();
-      status = mPriv->session->Run(
-        {{ "input_node", input }, { "input_lengths", n_frames }},
-        {"logits_output_node"}, {}, &outputs);
-    }
-
-    if (!status.ok()) {
-      std::cerr << "Error running session: " << status.ToString() << "\n";
-      return NULL;
-    }
-
-    auto logits_mapped = outputs[0].tensor<float, 3>();
-    // The CTCDecoder works with log-probs.
-    for (int t = 0; t < timesteps; ++t) {
-      for (int b = 0; b < batch_size; ++b) {
-        for (int c = 0; c < num_classes; ++c) {
-          input_data_mat[t][b][c] = logits_mapped(t, b, c);
-        }
-      }
-    }
+  if (!model) {
+    std::cerr << "Could not allocate model state." << std::endl;
+    return DS_ERR_FAIL_CREATE_MODEL;
   }
 
-  return decode(aNFrames, input_data_mat);
+  int err = model->init(aModelPath, aNCep, aNContext, aAlphabetConfigPath, aBeamWidth);
+  if (err != DS_ERR_OK) {
+    return err;
+  }
+
+  *retval = model.release();
+  return DS_ERR_OK;
+}
+
+void
+DS_DestroyModel(ModelState* ctx)
+{
+  delete ctx;
+}
+
+int
+DS_EnableDecoderWithLM(ModelState* aCtx,
+                       const char* aAlphabetConfigPath,
+                       const char* aLMPath,
+                       const char* aTriePath,
+                       float aLMAlpha,
+                       float aLMBeta)
+{
+  try {
+    aCtx->scorer_ = new Scorer(aLMAlpha, aLMBeta,
+                               aLMPath ? aLMPath : "",
+                               aTriePath ? aTriePath : "",
+                               *aCtx->alphabet_);
+    return DS_ERR_OK;
+  } catch (...) {
+    return DS_ERR_INVALID_LM;
+  }
+}
+
+int
+DS_SetupStream(ModelState* aCtx,
+               unsigned int aPreAllocFrames,
+               unsigned int aSampleRate,
+               StreamingState** retval)
+{
+  *retval = nullptr;
+
+  std::unique_ptr<StreamingState> ctx(new StreamingState());
+  if (!ctx) {
+    std::cerr << "Could not allocate streaming state." << std::endl;
+    return DS_ERR_FAIL_CREATE_STREAM;
+  }
+
+  const size_t num_classes = aCtx->alphabet_->GetSize() + 1; // +1 for blank
+
+  // Default initial allocation = 3 seconds.
+  if (aPreAllocFrames == 0) {
+    aPreAllocFrames = 150;
+  }
+
+  ctx->audio_buffer_.reserve(aCtx->audio_win_len_);
+  ctx->mfcc_buffer_.reserve(aCtx->mfcc_feats_per_timestep_);
+  ctx->mfcc_buffer_.resize(aCtx->n_features_*aCtx->n_context_, 0.f);
+  ctx->batch_buffer_.reserve(aCtx->n_steps_ * aCtx->mfcc_feats_per_timestep_);
+  ctx->previous_state_c_.resize(aCtx->state_size_, 0.f);
+  ctx->previous_state_h_.resize(aCtx->state_size_, 0.f);
+  ctx->model_ = aCtx;
+
+  ctx->decoder_state_.reset(decoder_init(*aCtx->alphabet_, num_classes, aCtx->scorer_));
+
+  *retval = ctx.release();
+  return DS_ERR_OK;
+}
+
+void
+DS_FeedAudioContent(StreamingState* aSctx,
+                    const short* aBuffer,
+                    unsigned int aBufferSize)
+{
+  aSctx->feedAudioContent(aBuffer, aBufferSize);
 }
 
 char*
-Model::stt(const short* aBuffer, unsigned int aBufferSize, int aSampleRate)
+DS_IntermediateDecode(StreamingState* aSctx)
 {
-  float* mfcc;
-  char* string;
-  int n_frames;
-
-  getInputVector(aBuffer, aBufferSize, aSampleRate, &mfcc, &n_frames, NULL);
-  string = infer(mfcc, n_frames);
-  free(mfcc);
-  return string;
+  return aSctx->intermediateDecode();
 }
 
+char*
+DS_FinishStream(StreamingState* aSctx)
+{
+  char* str = aSctx->finishStream();
+  DS_DiscardStream(aSctx);
+  return str;
+}
+
+Metadata*
+DS_FinishStreamWithMetadata(StreamingState* aSctx)
+{
+  Metadata* metadata = aSctx->finishStreamWithMetadata();
+  DS_DiscardStream(aSctx);
+  return metadata;
+}
+
+StreamingState*
+SetupStreamAndFeedAudioContent(ModelState* aCtx,
+                               const short* aBuffer,
+                               unsigned int aBufferSize,
+                               unsigned int aSampleRate)
+{
+  StreamingState* ctx;
+  int status = DS_SetupStream(aCtx, 0, aSampleRate, &ctx);
+  if (status != DS_ERR_OK) {
+    return nullptr;
+  }
+  DS_FeedAudioContent(ctx, aBuffer, aBufferSize);
+  return ctx;
+}
+
+char*
+DS_SpeechToText(ModelState* aCtx,
+                const short* aBuffer,
+                unsigned int aBufferSize,
+                unsigned int aSampleRate)
+{
+  StreamingState* ctx = SetupStreamAndFeedAudioContent(aCtx, aBuffer, aBufferSize, aSampleRate);
+  return DS_FinishStream(ctx);
+}
+
+Metadata*
+DS_SpeechToTextWithMetadata(ModelState* aCtx,
+                            const short* aBuffer,
+                            unsigned int aBufferSize,
+                            unsigned int aSampleRate)
+{
+  StreamingState* ctx = SetupStreamAndFeedAudioContent(aCtx, aBuffer, aBufferSize, aSampleRate);
+  return DS_FinishStreamWithMetadata(ctx);
+}
+
+void
+DS_DiscardStream(StreamingState* aSctx)
+{
+  delete aSctx;
+}
+
+void
+DS_FreeMetadata(Metadata* m)
+{
+  if (m) {
+    for (int i = 0; i < m->num_items; ++i) {
+      free(m->items[i].character);
+    }
+    delete[] m->items;
+    delete m;
+  }
+}
+
+void
+DS_FreeString(char* str)
+{
+  free(str);
+}
+
+void
+DS_PrintVersions() {
+  std::cerr << "TensorFlow: " << tf_local_git_version() << std::endl;
+  std::cerr << "DeepSpeech: " << ds_git_version() << std::endl;
+#ifdef __ANDROID__
+  LOGE("TensorFlow: %s", tf_local_git_version());
+  LOGD("TensorFlow: %s", tf_local_git_version());
+  LOGE("DeepSpeech: %s", ds_git_version());
+  LOGD("DeepSpeech: %s", ds_git_version());
+#endif
 }
